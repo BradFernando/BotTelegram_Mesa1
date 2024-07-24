@@ -4,15 +4,20 @@ from datetime import datetime
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
-from sqlalchemy.orm import sessionmaker, declarative_base
+from sqlalchemy.orm import sessionmaker, declarative_base, relationship
 from sqlalchemy.future import select
-from sqlalchemy import Column, Integer, String
+from sqlalchemy import Column, Integer, String, Numeric, ForeignKey, func
 import threading
 from dotenv import load_dotenv
 import os
+import json
 
 # Load environment variables from .env file
 load_dotenv()
+
+# Load responses from JSON file
+with open("text/responses.json", "r", encoding="utf-8") as f:
+    responses = json.load(f)
 
 # Database setup
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -44,7 +49,6 @@ class Category(Base):
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String, index=True)
     slug = Column(String, index=True)
-    #products = Column(String, index=True)  # Assuming 'products' is a string, update if it's another type
 
 
 # Database model for Product
@@ -52,15 +56,38 @@ class Product(Base):
     __tablename__ = 'Product'
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String, index=True)
-    price = Column(String, index=True)
+    price = Column(Numeric(10, 2), index=True)  # Changed String to Numeric
     image = Column(String)
-    categoryId = Column(Integer, index=True)
-    #category = Column(String)
-    #orderItems = Column(String)
+    categoryId = Column(Integer, ForeignKey('Category.id'))
+
+    # Define the relationship with OrderProducts
+    orders = relationship("OrderProducts", back_populates="product")
+
+
+# Database model for Order
+class Order(Base):
+    __tablename__ = 'orders'
+
+    id = Column(Integer, primary_key=True)
+    order_products = relationship("OrderProducts", back_populates="order")
+
+
+# Database model for OrderProducts
+class OrderProducts(Base):
+    __tablename__ = 'OrderProducts'
+    id = Column(Integer, primary_key=True)
+    orderId = Column(Integer, ForeignKey('orders.id'))
+    productId = Column(Integer, ForeignKey('Product.id'))
+    quantity = Column(Integer)
+
+    # Define relationships
+    order = relationship("Order", back_populates="order_products")
+    product = relationship("Product", back_populates="orders")
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Sends a greeting message followed by inline buttons."""
+    logger.info("Handling /start command")
     if isinstance(update, Update) and update.message:
         user_first_name = update.message.from_user.first_name
         chat_id = update.message.chat_id
@@ -68,16 +95,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         user_first_name = update.callback_query.from_user.first_name
         chat_id = update.callback_query.message.chat_id
     else:
+        logger.warning("Update does not have message or callback_query")
         return  # Exit if neither condition is met
 
     bot_name = "BotMesero"
     greeting = get_greeting()
-    greeting_message = (
-        f"{greeting}, {user_first_name}. Me llamo {bot_name}, estoy aquí para ayudarte en la toma de pedidos el día "
-        f"de hoy. Para poder avanzar, permíteme mostrarte la ID de este chat: \n\n{chat_id}\n\nNecesito que la "
-        f"guardes para"
-        f" el momento que uses el aplicativo.🤖🦾"
-    )
+    greeting_message = responses["greeting_message"].format(user_first_name=user_first_name, chat_id=chat_id)
 
     if isinstance(update, Update) and update.message:
         await update.message.reply_text(greeting_message, parse_mode='Markdown')
@@ -85,24 +108,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.callback_query.message.edit_text(greeting_message, parse_mode='Markdown')
 
     keyboard = [
-        [
-            InlineKeyboardButton("Cuál es el menú de hoy 📋", callback_data="menu")
-        ],
-        [
-            InlineKeyboardButton("Cómo puedo realizar un pedido 📑❓", callback_data="pedido")
-        ],
-        [
-            InlineKeyboardButton("Preguntas acerca del Bot 🤖⁉️", callback_data="otros")
-        ],
+        [InlineKeyboardButton("Cuál es el menú de hoy 📋", callback_data="menu")],
+        [InlineKeyboardButton("Cómo puedo realizar un pedido 📑❓", callback_data="pedido")],
+        [InlineKeyboardButton("Preguntas acerca del Bot 🤖⁉", callback_data="otros")],
     ]
-
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     if isinstance(update, Update) and update.message:
-        await update.message.reply_text("Para poder avanzar, elige una opción ⬇️:", reply_markup=reply_markup)
+        await update.message.reply_text(responses["menu_message"], reply_markup=reply_markup)
     elif isinstance(update, Update) and update.callback_query:
-        await update.callback_query.message.edit_text("Para poder avanzar, elige una opción:",
-                                                      reply_markup=reply_markup)
+        await update.callback_query.message.edit_text(responses["menu_message"], reply_markup=reply_markup)
 
 
 def get_otros_keyboard() -> InlineKeyboardMarkup:
@@ -114,7 +129,7 @@ def get_otros_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("Puse mal una orden ¿Qué puedo hacer? 😬❓", callback_data="orden_mal")],
         [InlineKeyboardButton("El aplicativo no abre. 😖", callback_data="app_no_abre")],
         [InlineKeyboardButton("Sobre la información Proporcionada 🤔:", callback_data="info_proporcionada")],
-        [InlineKeyboardButton("Regresar al Inicio ↩️", callback_data="return_start")]
+        [InlineKeyboardButton("Regresar al Inicio ↩", callback_data="return_start")]
     ]
     return InlineKeyboardMarkup(keyboard)
 
@@ -126,120 +141,151 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     # CallbackQueries need to be answered, even if no notification to the user is needed
     await query.answer()
 
+    logger.info(f"Callback data received: {query.data}")
+
     if query.data == "menu":
         await show_categories(query)
     elif query.data.startswith("category_"):
         category_id = int(query.data.split("_")[1])
         await show_products(query, category_id)
     elif query.data == "pedido":
-        response = (
-            "Para realizar un pedido, usarás una MiniApp 🥸📲:\n"
-            "1. En la esquina inferior izquierda alado de la caja de envio de mensajes encontrarás un botón de Menú.\n"
-            "2. El boton de llevará la ventana del menu donde esogerás todos los pedidos que desees o requieras.\n"
-            "3. Deberás tener en cuenta el valor del pago en los pedidos asi que se cuidadoso de no pasarte de tu presupuesto.\n"
-            "4. Al momento de enviar los pedidos en caja analizarán tu pedido procura ser paciente.\n"
-            "5. Si tu pago es en transferencia el cajero analizará el comprobante de pago que hayas cargado, recuerda debe ser una captura de pantalla clara y legible, si lo haces mal deberás repetir tu pedido.\n"
-            "6. Si tu pago es en efectivo puedes acercarte en caja a pagar, informa al cajero cual es tu ID, y si tienes alguna pregunta realizala."
-        )
-        keyboard = [[InlineKeyboardButton("Regresar al Inicio ↩️", callback_data="return_start")]]
+        response = responses["pedido_response"]
+        keyboard = [[InlineKeyboardButton("Regresar al Inicio ↩", callback_data="return_start")]]
         reply_markup = InlineKeyboardMarkup(keyboard)
         await query.edit_message_text(text=response, reply_markup=reply_markup)
     elif query.data == "otros":
         reply_markup = get_otros_keyboard()
-        await query.edit_message_text(text="Preguntas acerca del Bot 🤖⁉️:", reply_markup=reply_markup)
+        await query.edit_message_text(text=responses["other_questions_message"], reply_markup=reply_markup)
     elif query.data == "tiempo_pedido":
-        response = (
-            "Tu pedido demorará dependiendo la complejidad de la preparación del mismo no puede sobrepasar los 15 minutos "
-            "si algo sucede informa algun encargado del establecimiento."
-        )
-        keyboard = [[InlineKeyboardButton("Regresar a las Preguntas ↩️", callback_data="return_otros")]]
+        response = responses["tiempo_pedido_response"]
+        keyboard = [[InlineKeyboardButton("Regresar a las Preguntas ↩", callback_data="return_otros")]]
         reply_markup = InlineKeyboardMarkup(keyboard)
         await query.edit_message_text(text=response, reply_markup=reply_markup)
     elif query.data == "producto_mas_pedido":
-        response = "Aquí quiero que lo dejes vacío porque esto lo haré con la BDD."
-        keyboard = [[InlineKeyboardButton("Regresar a las Preguntas ↩️", callback_data="return_otros")]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await query.edit_message_text(text=response, reply_markup=reply_markup)
+        await show_most_ordered_product(query)
     elif query.data == "orden_mal":
-        response = (
-            "Tus ordenes se reciben y tienes un rango de 5 minutos para realizar el pago sino el tiempo se considerará como "
-            "excedido y el cajero eliminará tu orden, deberás crear otra nuevamente."
-        )
-        keyboard = [[InlineKeyboardButton("Regresar a las Preguntas ↩️", callback_data="return_otros")]]
+        response = responses["orden_mal_response"]
+        keyboard = [[InlineKeyboardButton("Regresar a las Preguntas ↩", callback_data="return_otros")]]
         reply_markup = InlineKeyboardMarkup(keyboard)
         await query.edit_message_text(text=response, reply_markup=reply_markup)
     elif query.data == "app_no_abre":
-        response = (
-            "Si la aplicación no abre, verifica que tienes conexión a Internet y que tienes la última versión instalada."
-        )
-        keyboard = [[InlineKeyboardButton("Regresar a las Preguntas ↩️", callback_data="return_otros")]]
+        response = responses["app_no_abre_response"]
+        keyboard = [[InlineKeyboardButton("Regresar a las Preguntas ↩", callback_data="return_otros")]]
         reply_markup = InlineKeyboardMarkup(keyboard)
         await query.edit_message_text(text=response, reply_markup=reply_markup)
     elif query.data == "info_proporcionada":
-        response = (
-            "Se proporciona información básica para poder ayudarte en lo que necesites, si requieres más ayuda contacta a un"
-            " encargado del establecimiento."
-        )
-        keyboard = [[InlineKeyboardButton("Regresar a las Preguntas ↩️", callback_data="return_otros")]]
+        response = responses["info_proporcionada_response"]
+        keyboard = [[InlineKeyboardButton("Regresar a las Preguntas ↩", callback_data="return_otros")]]
         reply_markup = InlineKeyboardMarkup(keyboard)
         await query.edit_message_text(text=response, reply_markup=reply_markup)
     elif query.data == "return_start":
         await start(update, context)
     elif query.data == "return_otros":
         reply_markup = get_otros_keyboard()
-        await query.edit_message_text(text="Preguntas acerca del Bot 🤖⁉️:", reply_markup=reply_markup)
+        await query.edit_message_text(text=responses["other_questions_message"], reply_markup=reply_markup)
+    elif query.data == "return_categories":
+        logger.info("Returning to categories")
+        await show_categories(query)
 
 
 async def show_categories(query: Update.callback_query):
     """Fetches categories from the database and shows them as inline buttons."""
+    logger.info("Fetching categories from the database")
     async with SessionLocal() as session:
         async with session.begin():
             categories = (await session.execute(select(Category))).scalars().all()
-            keyboard = [
-                [InlineKeyboardButton(category.name, callback_data=f"category_{category.id}")]
-                for category in categories
-            ]
-            # Add the return button at the end
-            keyboard.append([InlineKeyboardButton("Regresar al Inicio", callback_data="return_start")])
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            await query.edit_message_text(text="Elige una categoría:", reply_markup=reply_markup)
+            logger.info(f"Found categories: {categories}")
+
+    if not categories:
+        await query.edit_message_text(text="No hay categorías disponibles.")
+        return
+
+    keyboard = []
+    for category in categories:
+        keyboard.append([InlineKeyboardButton(category.name, callback_data=f"category_{category.id}")])
+
+    keyboard.append([InlineKeyboardButton("Regresar al Inicio ⬆️", callback_data="return_start")])
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await query.edit_message_text(text="Selecciona una categoría:", reply_markup=reply_markup)
 
 
-async def show_products(query: Update, category_id: int) -> None:
-    """Fetches products for a category from the database and displays them as buttons."""
+async def show_products(query: Update.callback_query, category_id: int) -> None:
+    """Fetches products for a given category and shows them as inline buttons."""
+    logger.info(f"Fetching products for category_id: {category_id}")
     async with SessionLocal() as session:
         async with session.begin():
             result = await session.execute(select(Product).where(Product.categoryId == category_id))
             products = result.scalars().all()
+            logger.info(f"Found products: {products}")
 
     if not products:
-        await query.edit_message_text("No se encontraron productos para esta categoría. 😔")
+        await query.edit_message_text(text="No hay productos disponibles en esta categoría.")
         return
 
-    keyboard = [
-        [InlineKeyboardButton(f"{product.name} - ${product.price}", callback_data=f"product_{product.id}")]
-        for product in products
-    ]
+    keyboard = []
+    for product in products:
+        # Include product price in the button text
+        button_text = f"{product.name} - ${product.price:.2f}"
+        keyboard.append([InlineKeyboardButton(button_text, callback_data=f"product_{product.id}")])
 
-    # Add the return to categories button
-    keyboard.append(
-        [InlineKeyboardButton("Regresar a las categorías", callback_data="return_start")])  # Cambiado a "return_start"
-
+    keyboard.append([InlineKeyboardButton("Regresar a las Categorías ⬆️", callback_data="return_categories")])
     reply_markup = InlineKeyboardMarkup(keyboard)
-    await query.edit_message_text("Selecciona un producto ⬇️:", reply_markup=reply_markup)
+    await query.edit_message_text(text="Elige un producto:", reply_markup=reply_markup)
+
+
+async def show_most_ordered_product(query: Update.callback_query) -> None:
+    """Fetches the most ordered product from the database and shows it."""
+    logger.info("Fetching the most ordered product from the database")
+
+    try:
+        async with SessionLocal() as session:
+            async with session.begin():
+                stmt = (
+                    select(Product.name, func.sum(OrderProducts.quantity).label("total_quantity"))
+                    .join(OrderProducts, Product.id == OrderProducts.productId)  # Join Product and OrderProducts
+                    .group_by(Product.name)  # Group by product name
+                    .order_by(func.sum(OrderProducts.quantity).desc())  # Order by total quantity descending
+                    .limit(1)  # Limit the result to 1 (the most ordered)
+                )
+                result = await session.execute(stmt)
+                most_ordered = result.first()
+
+                # Verify if a result was found
+                if most_ordered:
+                    product_name, total_quantity = most_ordered
+                    response = f"El producto más pedido es: {product_name} con un total de {total_quantity} pedidos."
+                else:
+                    response = "No se encontraron pedidos."
+
+    except Exception as e:
+        logger.error(f"An error occurred: {e}")
+        response = "Ocurrió un error al procesar la solicitud."
+
+    # Create the keyboard with a button to return
+    keyboard = [[InlineKeyboardButton("Regresar a las Preguntas ↩", callback_data="return_otros")]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    # Edit the user's message with the response and the keyboard
+    await query.edit_message_text(text=response, reply_markup=reply_markup)
 
 
 def run_bot(application: Application) -> None:
-    """Run the bot in its own event loop."""
-    asyncio.set_event_loop(asyncio.new_event_loop())
+    """Runs the bot using an event loop."""
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
     application.run_polling()
 
 
 async def main() -> None:
     """Start the bot."""
+    logger.info("Starting the bot")
     bot_token_1 = os.getenv("BOT_TOKEN_1")
     bot_token_2 = os.getenv("BOT_TOKEN_2")
     bot_token_3 = os.getenv("BOT_TOKEN_3")
+
+    if not bot_token_1 or not bot_token_2 or not bot_token_3:
+        logger.error("Bot tokens are not set. Please check your .env file.")
+        return
 
     # Create application instances for each bot
     application_1 = Application.builder().token(bot_token_1).build()
