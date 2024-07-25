@@ -1,19 +1,23 @@
 import logging
-import asyncio
 from datetime import datetime
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
+from telegram.ext import Application, CallbackQueryHandler, CommandHandler, MessageHandler, ContextTypes, filters
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker, declarative_base, relationship
 from sqlalchemy.future import select
 from sqlalchemy import Column, Integer, String, Numeric, ForeignKey, func
-import threading
-from dotenv import load_dotenv
-import os
 import json
+import os
+from typing import Union
+from dotenv import load_dotenv
+import openai  # Importar la librería de OpenAI
 
 # Load environment variables from .env file
 load_dotenv()
+
+# Configurar API de OpenAI
+openai.api_key = os.getenv(
+    "OPENAI_API_KEY")  # Asegúrate de tener la clave API en tus variables de entorno
 
 # Load responses from JSON file
 with open("text/responses.json", "r", encoding="utf-8") as f:
@@ -88,6 +92,8 @@ class OrderProducts(Base):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Sends a greeting message followed by inline buttons."""
     logger.info("Handling /start command")
+
+    # Determine the source of the update
     if isinstance(update, Update) and update.message:
         user_first_name = update.message.from_user.first_name
         chat_id = update.message.chat_id
@@ -100,7 +106,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     bot_name = "BotMesero"
     greeting = get_greeting()
-    greeting_message = responses["greeting_message"].format(user_first_name=user_first_name, chat_id=chat_id)
+
+    # Log the chat_id to ensure it's being captured correctly
+    logger.info(f"Chat ID: {chat_id}")
+
+    # Format the greeting message using Markdown
+    greeting_message = responses["greeting_message"].format(
+        user_first_name=user_first_name,
+        chat_id=f"`{chat_id}`"  # Markdown format for code block
+    )
 
     if isinstance(update, Update) and update.message:
         await update.message.reply_text(greeting_message, parse_mode='Markdown')
@@ -118,6 +132,89 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(responses["menu_message"], reply_markup=reply_markup)
     elif isinstance(update, Update) and update.callback_query:
         await update.callback_query.message.edit_text(responses["menu_message"], reply_markup=reply_markup)
+
+
+async def get_most_ordered_product() -> str:
+    """Fetches the most ordered product from the database."""
+    logger.info("Fetching the most ordered product")
+    async with SessionLocal() as session:
+        async with session.begin():
+            result = await session.execute(
+                select(Product)
+                .join(OrderProducts)
+                .group_by(Product.id)
+                .order_by(func.count(OrderProducts.id).desc())
+                .limit(1)
+            )
+            most_ordered_product = result.scalars().first()
+            logger.info(f"Most ordered product: {most_ordered_product}")
+
+    if most_ordered_product:
+        price = f"{most_ordered_product.price:.2f}"  # Format price to 2 decimal places
+        response = f"El producto más pedido es {most_ordered_product.name} a un precio de ${price}."
+    else:
+        response = "No se encontró información sobre el producto más pedido."
+
+    return response
+
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handles incoming text messages from users."""
+    user_message = update.message.text
+    logger.info(f"Received message from user: {user_message}")
+
+    # Verificar si el mensaje del usuario pide el menú
+    if "menú" in user_message.lower():
+        # Crear un objeto de consulta falso para pasar a show_categories
+        fake_query = type('FakeQuery', (object,), {'edit_message_text': update.message.reply_text})
+        await show_categories(fake_query)
+        return
+
+    # Verificar si el mensaje del usuario pregunta por el producto más pedido
+    if "producto más pedido" in user_message.lower() or "producto más vendido" in user_message.lower():
+        # Obtener el producto más pedido
+        response = await get_most_ordered_product()
+        await update.message.reply_text(response)
+        return
+
+    # Obtener el historial de la conversación
+    chat_id = update.message.chat_id
+    if "conversation_history" not in context.chat_data:
+        context.chat_data["conversation_history"] = []
+
+    # Añadir el mensaje del usuario al historial
+    context.chat_data["conversation_history"].append({"role": "user", "content": user_message})
+
+    # Definir el contexto inicial del sistema
+    system_context = {
+        "role": "system",
+        "content": (
+            "Eres un asistente para un restaurante que ayuda a los usuarios con el menú, "
+            "realizar pedidos y responder preguntas comunes sobre el establecimiento."
+        )
+    }
+
+    # Construir el historial de mensajes para el modelo
+    messages = [system_context] + context.chat_data["conversation_history"]
+
+    try:
+        # Enviar el historial de mensajes al modelo GPT-4 para obtener una respuesta
+        response = openai.ChatCompletion.create(
+            model="gpt-3.5-turbo",  # Puedes usar "gpt-4" si tienes acceso a ese modelo
+            messages=messages
+        )
+
+        # Extraer el contenido de la respuesta de GPT-4
+        gpt_response = response.choices[0].message['content'].strip()
+
+        # Añadir la respuesta del asistente al historial
+        context.chat_data["conversation_history"].append({"role": "assistant", "content": gpt_response})
+
+        # Enviar la respuesta de vuelta al usuario
+        await update.message.reply_text(gpt_response)
+    except Exception as e:
+        logger.error(f"Error generating response: {e}")
+        await update.message.reply_text("Lo siento, algo salió mal al procesar tu solicitud.")
 
 
 def get_otros_keyboard() -> InlineKeyboardMarkup:
@@ -204,18 +301,19 @@ async def show_categories(query: Update.callback_query):
     for category in categories:
         keyboard.append([InlineKeyboardButton(category.name, callback_data=f"category_{category.id}")])
 
-    keyboard.append([InlineKeyboardButton("Regresar al Inicio ⬆️", callback_data="return_start")])
+    keyboard.append([InlineKeyboardButton("Regresar al Inicio ↩", callback_data="return_start")])
     reply_markup = InlineKeyboardMarkup(keyboard)
     await query.edit_message_text(text="Selecciona una categoría:", reply_markup=reply_markup)
 
 
-async def show_products(query: Update.callback_query, category_id: int) -> None:
-    """Fetches products for a given category and shows them as inline buttons."""
-    logger.info(f"Fetching products for category_id: {category_id}")
+async def show_products(query: Update.callback_query, category_id: int):
+    """Fetches products for a specific category and shows them as inline buttons."""
+    logger.info(f"Fetching products for category {category_id}")
     async with SessionLocal() as session:
         async with session.begin():
-            result = await session.execute(select(Product).where(Product.categoryId == category_id))
-            products = result.scalars().all()
+            products = (await session.execute(
+                select(Product).filter(Product.categoryId == category_id)
+            )).scalars().all()
             logger.info(f"Found products: {products}")
 
     if not products:
@@ -224,95 +322,51 @@ async def show_products(query: Update.callback_query, category_id: int) -> None:
 
     keyboard = []
     for product in products:
-        # Include product price in the button text
-        button_text = f"{product.name} - ${product.price:.2f}"
-        keyboard.append([InlineKeyboardButton(button_text, callback_data=f"product_{product.id}")])
+        price = f"{product.price:.2f}"  # Format price to 2 decimal places
+        keyboard.append([InlineKeyboardButton(f"{product.name} - ${price}", callback_data=f"product_{product.id}")])
 
-    keyboard.append([InlineKeyboardButton("Regresar a las Categorías ⬆️", callback_data="return_categories")])
+    keyboard.append([InlineKeyboardButton("Regresar a Categorías ↩", callback_data="return_categories")])
     reply_markup = InlineKeyboardMarkup(keyboard)
-    await query.edit_message_text(text="Elige un producto:", reply_markup=reply_markup)
+    await query.edit_message_text(text="Selecciona un producto:", reply_markup=reply_markup)
 
 
 async def show_most_ordered_product(query: Update.callback_query) -> None:
-    """Fetches the most ordered product from the database and shows it."""
-    logger.info("Fetching the most ordered product from the database")
+    """Fetches and shows the most ordered product."""
+    logger.info("Fetching the most ordered product")
+    async with SessionLocal() as session:
+        async with session.begin():
+            result = await session.execute(
+                select(Product)
+                .join(OrderProducts)
+                .group_by(Product.id)
+                .order_by(func.count(OrderProducts.id).desc())
+                .limit(1)
+            )
+            most_ordered_product = result.scalars().first()
+            logger.info(f"Most ordered product: {most_ordered_product}")
 
-    try:
-        async with SessionLocal() as session:
-            async with session.begin():
-                stmt = (
-                    select(Product.name, func.sum(OrderProducts.quantity).label("total_quantity"))
-                    .join(OrderProducts, Product.id == OrderProducts.productId)  # Join Product and OrderProducts
-                    .group_by(Product.name)  # Group by product name
-                    .order_by(func.sum(OrderProducts.quantity).desc())  # Order by total quantity descending
-                    .limit(1)  # Limit the result to 1 (the most ordered)
-                )
-                result = await session.execute(stmt)
-                most_ordered = result.first()
+    if most_ordered_product:
+        price = f"{most_ordered_product.price:.2f}"  # Format price to 2 decimal places
+        response = f"El producto más pedido es {most_ordered_product.name} a un precio de ${price}."
+    else:
+        response = "No se encontró información sobre el producto más pedido."
 
-                # Verify if a result was found
-                if most_ordered:
-                    product_name, total_quantity = most_ordered
-                    response = f"El producto más pedido es: {product_name} con un total de {total_quantity} pedidos."
-                else:
-                    response = "No se encontraron pedidos."
-
-    except Exception as e:
-        logger.error(f"An error occurred: {e}")
-        response = "Ocurrió un error al procesar la solicitud."
-
-    # Create the keyboard with a button to return
     keyboard = [[InlineKeyboardButton("Regresar a las Preguntas ↩", callback_data="return_otros")]]
     reply_markup = InlineKeyboardMarkup(keyboard)
-
-    # Edit the user's message with the response and the keyboard
     await query.edit_message_text(text=response, reply_markup=reply_markup)
 
 
-def run_bot(application: Application) -> None:
-    """Runs the bot using an event loop."""
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
+def main() -> None:
+    """Start the bot."""
+    logger.info("Starting the bot")
+    application = Application.builder().token(os.getenv("BOT_TOKEN_1")).build()
+
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CallbackQueryHandler(button))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))  # Manejar mensajes de texto
+
     application.run_polling()
 
 
-async def main() -> None:
-    """Start the bot."""
-    logger.info("Starting the bot")
-    bot_token_1 = os.getenv("BOT_TOKEN_1")
-    bot_token_2 = os.getenv("BOT_TOKEN_2")
-    bot_token_3 = os.getenv("BOT_TOKEN_3")
-
-    if not bot_token_1 or not bot_token_2 or not bot_token_3:
-        logger.error("Bot tokens are not set. Please check your .env file.")
-        return
-
-    # Create application instances for each bot
-    application_1 = Application.builder().token(bot_token_1).build()
-    application_2 = Application.builder().token(bot_token_2).build()
-    application_3 = Application.builder().token(bot_token_3).build()
-
-    # Add handlers to the first bot
-    application_1.add_handler(CommandHandler("start", start))
-    application_1.add_handler(CallbackQueryHandler(button))
-
-    # Add handlers to the second bot
-    application_2.add_handler(CommandHandler("start", start))
-    application_2.add_handler(CallbackQueryHandler(button))
-
-    # Add handlers to the third bot
-    application_3.add_handler(CommandHandler("start", start))
-    application_3.add_handler(CallbackQueryHandler(button))
-
-    # Start the bots using threading
-    threading.Thread(target=run_bot, args=(application_1,), daemon=True).start()
-    threading.Thread(target=run_bot, args=(application_2,), daemon=True).start()
-    threading.Thread(target=run_bot, args=(application_3,), daemon=True).start()
-
-    # Keep the main thread alive
-    while True:
-        await asyncio.sleep(1)
-
-
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
