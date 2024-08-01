@@ -1,33 +1,43 @@
+import json
 import logging
+import os
 from datetime import datetime
+
+import openai  # Importar la librería de OpenAI
+from dotenv import load_dotenv
+from sqlalchemy import Column, Integer, String, Numeric, ForeignKey, func
+from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
+from sqlalchemy.future import select
+from sqlalchemy.orm import declarative_base, relationship
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, MessageHandler, ContextTypes, filters
-from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
-from sqlalchemy.orm import sessionmaker, declarative_base, relationship
-from sqlalchemy.future import select
-from sqlalchemy import Column, Integer, String, Numeric, ForeignKey, func
-import json
-import os
-from typing import Union
-from dotenv import load_dotenv
-import openai  # Importar la librería de OpenAI
 
 # Load environment variables from .env file
 load_dotenv()
 
 # Configurar API de OpenAI
 openai.api_key = os.getenv(
-    "OPENAI_API_KEY")  # Asegúrate de tener la clave API en tus variables de entorno
+    "OPENAI_API_KEY")
 
 # Load responses from JSON file
 with open("text/responses.json", "r", encoding="utf-8") as f:
     responses = json.load(f)
 
+# Load rules from JSON file
+with open("text/rulesGPT.json", "r", encoding="utf-8") as f:
+    rules = json.load(f)["rules"]
+
+# Construct system context dynamically
+system_context = {
+    "role": "system",
+    "content": " ".join(rules)
+}
+
 # Database setup
 DATABASE_URL = os.getenv("DATABASE_URL")
 Base = declarative_base()
 engine = create_async_engine(DATABASE_URL, echo=True)
-SessionLocal = sessionmaker(bind=engine, class_=AsyncSession, expire_on_commit=False)
+SessionLocal = async_sessionmaker(bind=engine, expire_on_commit=False)
 
 # Enable logging
 logging.basicConfig(
@@ -134,30 +144,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.callback_query.message.edit_text(responses["menu_message"], reply_markup=reply_markup)
 
 
-async def get_most_ordered_product() -> str:
-    """Fetches the most ordered product from the database."""
-    logger.info("Fetching the most ordered product")
-    async with SessionLocal() as session:
-        async with session.begin():
-            result = await session.execute(
-                select(Product)
-                .join(OrderProducts)
-                .group_by(Product.id)
-                .order_by(func.count(OrderProducts.id).desc())
-                .limit(1)
-            )
-            most_ordered_product = result.scalars().first()
-            logger.info(f"Most ordered product: {most_ordered_product}")
-
-    if most_ordered_product:
-        price = f"{most_ordered_product.price:.2f}"  # Format price to 2 decimal places
-        response = f"El producto más pedido es {most_ordered_product.name} a un precio de ${price}."
-    else:
-        response = "No se encontró información sobre el producto más pedido."
-
-    return response
-
-
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handles incoming text messages from users."""
     user_message = update.message.text
@@ -165,16 +151,15 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     # Verificar si el mensaje del usuario pide el menú
     if "menú" in user_message.lower():
-        # Crear un objeto de consulta falso para pasar a show_categories
         fake_query = type('FakeQuery', (object,), {'edit_message_text': update.message.reply_text})
         await show_categories(fake_query)
         return
 
     # Verificar si el mensaje del usuario pregunta por el producto más pedido
-    if "producto más pedido" in user_message.lower() or "producto más vendido" in user_message.lower():
-        # Obtener el producto más pedido
-        response = await get_most_ordered_product()
-        await update.message.reply_text(response)
+    if any(keyword in user_message.lower() for keyword in
+           ["producto más pedido", "orden más pedida", "producto más vendido"]):
+        fake_query = type('FakeQuery', (object,), {'edit_message_text': update.message.reply_text})
+        await show_most_ordered_product(fake_query)
         return
 
     # Obtener el historial de la conversación
@@ -184,15 +169,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     # Añadir el mensaje del usuario al historial
     context.chat_data["conversation_history"].append({"role": "user", "content": user_message})
-
-    # Definir el contexto inicial del sistema
-    system_context = {
-        "role": "system",
-        "content": (
-            "Eres un asistente para un restaurante que ayuda a los usuarios con el menú, "
-            "realizar pedidos y responder preguntas comunes sobre el establecimiento."
-        )
-    }
 
     # Construir el historial de mensajes para el modelo
     messages = [system_context] + context.chat_data["conversation_history"]
